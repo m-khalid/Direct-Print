@@ -1,142 +1,112 @@
 from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
-import subprocess
-import os
-import tempfile
-import time
+import os, tempfile, win32print, win32ui
+from PIL import Image, ImageWin
+import imgkit
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS
+CORS(app)
+
+# Path to wkhtmltoimage.exe
+WKHTMLTOIMAGE_PATH = r"C:\Program Files\wkhtmltopdf\bin\wkhtmltoimage.exe"
+
+
+def print_image(printer_name, image_path):
+    """Scale image to printer page size and print"""
+    # Open printer
+    hprinter = win32print.OpenPrinter(printer_name)
+    printer_info = win32print.GetPrinter(hprinter, 2)
+    pdc = win32ui.CreateDC()
+    pdc.CreatePrinterDC(printer_name)
+
+    # Get printable area and paper size
+    HORZRES = 8
+    VERTRES = 10
+    PHYSICALWIDTH = 110
+    PHYSICALHEIGHT = 111
+    PHYSICALOFFSETX = 112
+    PHYSICALOFFSETY = 113
+
+    printable_area = (pdc.GetDeviceCaps(HORZRES), pdc.GetDeviceCaps(VERTRES))
+    printer_size = (pdc.GetDeviceCaps(PHYSICALWIDTH), pdc.GetDeviceCaps(PHYSICALHEIGHT))
+    margins = (pdc.GetDeviceCaps(PHYSICALOFFSETX), pdc.GetDeviceCaps(PHYSICALOFFSETY))
+
+    # Load image
+    img = Image.open(image_path)
+    img_width, img_height = img.size
+
+    # Scale image to fit page width/height
+    ratio = min(printable_area[0] / img_width, printable_area[1] / img_height)
+    scaled_width = int(img_width * ratio)
+    scaled_height = int(img_height * ratio)
+
+    # Center image on page
+    x1 = int((printer_size[0] - scaled_width) / 2)
+    y1 = int((printer_size[1] - scaled_height) / 2)
+    x2 = x1 + scaled_width
+    y2 = y1 + scaled_height
+
+    # Start print job
+    pdc.StartDoc("HTML Print Job")
+    pdc.StartPage()
+
+    dib = ImageWin.Dib(img)
+    dib.draw(pdc.GetHandleOutput(), (x1, y1, x2, y2))
+
+    pdc.EndPage()
+    pdc.EndDoc()
+    pdc.DeleteDC()
+    win32print.ClosePrinter(hprinter)
+
 
 @app.route('/')
 def index():
     return render_template('printer.html')
 
+
 @app.route('/print-html', methods=['POST'])
 def print_html():
+    print("inini")
     try:
-        # Get HTML content from request
         data = request.json
         html_content = data.get('html')
-        printer_name = data.get('printer', '')  # Optional printer name
+        printer_name = data.get('printer', '')
 
         if not html_content:
             return jsonify({'status': 'error', 'message': 'No HTML content provided'})
 
-        # Create temporary HTML file
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False, encoding='utf-8') as temp_file:
-            temp_file.write(html_content)
-            temp_html_path = temp_file.name
+        # Save HTML -> PNG
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_img:
+            temp_img_path = temp_img.name
 
-        # Print based on operating system
-        success = print_html_file(temp_html_path, printer_name)
+        config = imgkit.config(wkhtmltoimage=WKHTMLTOIMAGE_PATH)
+        imgkit.from_string(html_content, temp_img_path, config=config)
 
-        # Clean up
-        time.sleep(1)  # Wait a bit before deleting
-        os.unlink(temp_html_path)
+        # Get default printer if not passed
+        if not printer_name:
+            printer_name = win32print.GetDefaultPrinter()
+        # Print
+        print_image(printer_name, temp_img_path)
 
-        if success:
-            return jsonify({'status': 'success', 'message': 'HTML sent to printer successfully!'})
-        else:
-            return jsonify({'status': 'error', 'message': 'Failed to print. Check printer connection.'})
+        # Cleanup
+        os.unlink(temp_img_path)
 
-    except Exception as e:
-        return jsonify({'status': 'error', 'message': f'Error: {str(e)}'})
-
-def print_html_file(html_file_path, printer_name=''):
-    """Print HTML file using system commands"""
-    try:
-        if os.name == 'nt':  # Windows
-            # Method 1: Using Microsoft Edge (recommended for Windows)
-            edge_path = r'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe'
-            if os.path.exists(edge_path):
-                cmd = [
-                    edge_path,
-                    '--headless',
-                    '--print-to-pdf',
-                    '--print-to-pdf-no-header',
-                    f'--print-to-pdf={html_file_path}.pdf',
-                    html_file_path
-                ]
-                subprocess.run(cmd, check=True)
-
-                # Print the PDF
-                if printer_name:
-                    pdf_print_cmd = [
-                        'powershell',
-                        '-Command',
-                        f'Start-Process -FilePath "{html_file_path}.pdf" -Verb PrintTo -ArgumentList "{printer_name}"'
-                    ]
-                else:
-                    pdf_print_cmd = [
-                        'AcroRd32',
-                        '/t',
-                        f'{html_file_path}.pdf'
-                    ]
-                subprocess.run(pdf_print_cmd, check=True)
-                return True
-
-            # Method 2: Fallback - print as text
-            else:
-                cmd = ['notepad', '/p', html_file_path]
-                if printer_name:
-                    cmd.extend(['/pt', html_file_path, printer_name])
-                subprocess.run(cmd, check=True)
-                return True
-
-        else:  # Linux/macOS
-            # Convert HTML to PDF first for better printing quality
-            try:
-                # Try using wkhtmltopdf if available
-                subprocess.run(['wkhtmltopdf', html_file_path, f'{html_file_path}.pdf'], check=True)
-                print_cmd = ['lp']
-                if printer_name:
-                    print_cmd.extend(['-d', printer_name])
-                print_cmd.append(f'{html_file_path}.pdf')
-                subprocess.run(print_cmd, check=True)
-            except:
-                # Fallback: print directly as text
-                print_cmd = ['lp']
-                if printer_name:
-                    print_cmd.extend(['-d', printer_name])
-                print_cmd.append(html_file_path)
-                subprocess.run(print_cmd, check=True)
-
-            return True
-
-    except subprocess.CalledProcessError:
-        return False
-    except Exception:
-        return False
-
-@app.route('/get-printers', methods=['GET'])
-def get_printers():
-    """Get list of available printers"""
-    try:
-        printers = []
-
-        if os.name == 'nt':  # Windows
-            try:
-                import win32print
-                printer_list = win32print.EnumPrinters(2)  # Get all printers
-                printers = [printer[2] for printer in printer_list]
-            except ImportError:
-                # Fallback if win32print not available
-                result = subprocess.run(['wmic', 'printer', 'get', 'name'],
-                                      capture_output=True, text=True)
-                if result.returncode == 0:
-                    printers = [line.strip() for line in result.stdout.split('\n')
-                               if line.strip() and not line.startswith('Name')]
-
-        else:  # Linux/macOS
-            result = subprocess.run(['lpstat', '-a'], capture_output=True, text=True)
-            if result.returncode == 0:
-                printers = [line.split()[0] for line in result.stdout.split('\n') if line]
-
-        return jsonify({'status': 'success', 'printers': printer_list})
+        return jsonify({'status': 'success', 'message': 'Printed successfully'})
 
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)})
 
+
+@app.route('/get-printers', methods=['GET'])
+def get_printers():
+    printers = [p[2] for p in win32print.EnumPrinters(
+        win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS)]
+    return jsonify({
+        'status': 'success',
+        'printers': printers,
+        'default_printer': win32print.GetDefaultPrinter()
+    })
+
+
 if __name__ == '__main__':
-    app.run(debug=True, port=5000, host='0.0.0.0')
+    app.run(debug=True, port=5000)
